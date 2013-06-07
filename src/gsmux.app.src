@@ -1,0 +1,9 @@
+{application, gsms,
+ [
+  {description, "ETSI 07.10 Multiplexor"},
+  {vsn, git},
+  {registered, [gsmux]},
+  {mod, {gsmux_app,[]}},
+  {env, []},
+  {applications, [kernel,stdlib,uart]}
+ ]}.

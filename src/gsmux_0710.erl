@@ -19,8 +19,6 @@
 -export([establish/2, release/2, send/2]).
 -export([closedown/1, send_test/2]).
 
--export([run/0]).
-
 -define(SERVER, ?MODULE). 
 
 -record(subscriber,
@@ -34,7 +32,10 @@
 -record(state, {
 	  drv :: pid(),        %% uart driver pid
 	  ref :: reference(),  %% uart subscription ref
-	  sub = [] :: [#subscriber{}]
+	  sub = [] :: [#subscriber{}],
+	  manuf,
+	  model,
+	  cmux_opts
 	 }).
 
 -include("gsmux_0710.hrl").
@@ -44,41 +45,6 @@
 %%%===================================================================
 %%% API
 %%%===================================================================
-
-run() ->
-    {ok,Pid} = start([{device,"/dev/tty.usbserial-FTF5DP2J"},
-		      {baud,115200}]),
-    timer:sleep(3000),   %% up ? mux? fixme
-    Chan0 = spawn(fun() -> channel_init(Pid, 0) end),
-    Chan1 = spawn(fun() -> channel_init(Pid, 1) end),
-    Chan2 = spawn(fun() -> channel_init(Pid, 2) end),
-    {ok, [Chan0,Chan1,Chan2]}.
-
-channel_init(Pid, Chan) ->
-    R = establish(Pid, Chan),  %% establish multiplexer channel
-    io:format("Establish: ~w = ~p\n", [Chan, R]),
-    {ok,Pty} = uart:open("pty", [{baud,115200}]),
-    {ok,TTY} = uart:getopt(Pty, device),
-    io:format("chan=~w => pty = ~s\n", [Chan, TTY]),
-    %% create a link from /dev/ttyGSM<i> -> TTY
-    uart:setopts(Pty, [{active,once}]),
-    channel_loop(Pid,Pty,Chan,TTY).
-
-channel_loop(Pid,Pty,Chan,TTY) ->
-    receive
-	{uart,Pty,Data} ->
-	    uart:setopts(Pty, [{active,once}]),
-	    io:format("~w:~s: uart data: ~p\n", [Chan,TTY,Data]),
-	    send(Pid, Data),
-	    channel_loop(Pid, Pty, Chan,TTY);
-	{gsm_0710,Chan,Data} ->
-	    io:format("~w:~s: mux data: ~p\n", [Chan,TTY,Data]),
-	    uart:send(Pty,Data),
-	    channel_loop(Pid, Pty,Chan,TTY);
-	Other ->
-	    io:format("~w:~s: other: ~p\n", [Chan,TTY,Other]),
-	    channel_loop(Pid, Pty,Chan,TTY)
-    end.
 
 establish(Pid, I) ->
     gen_server:call(Pid, {establish,I,self()}).
@@ -131,9 +97,16 @@ start(Opts) ->
 %% @end
 %%--------------------------------------------------------------------
 init([Opts]) ->
-    {ok,Pid} = gsms_uart:start_link(Opts),
+    Device = proplists:get_value(device, Opts),
+    Baud   = proplists:get_value(baud, Opts, 115200),
+    Reopen = proplists:get_value(reopen_timeout,Opts,5000),
+    {Manuf,Model} = proplists:get_value(modem, Opts, {undefined,undefined}),
+    {ok,Pid} = gsms_uart:start_link([{device,Device},
+				     {baud, Baud},
+				     {reopen_timeout,Reopen}]),
     {ok,Ref} = gsms_uart:subscribe(Pid),  %% subscribe to all events
-    {ok, #state{ drv = Pid, ref = Ref } }.
+    {ok, #state{ drv = Pid, ref = Ref,
+		 manuf = Manuf, model = Model }}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -247,8 +220,27 @@ handle_info(_I={gsms_event,_Ref,
 	    {noreply, State}
     end;
 handle_info({gsms_uart,Pid,up}, State) ->
+    io:format("gms_uart : up\n", []),
+    timer:sleep(100),                  %% help?
     ok = gsms_uart:at(Pid,"E0"),       %% disable echo (again)
     timer:sleep(100),                  %% help?
+    Manuf = case gsms_uart:at(Pid,"+CGMI") of
+		{ok,Manuf0} -> Manuf0;
+		_ -> ""
+	    end,
+    io:format("Manuf : ~s\n", [Manuf]),
+    timer:sleep(100),                  %% help?
+    Model = case gsms_uart:at(Pid,"+CGMM") of
+		{ok,Model0} -> Model0;
+		_ -> ""
+	    end,
+    io:format("Model : ~s\n", [Model]),
+    CMuxOpts = gsms_uart:at(Pid,"+CMUX=?"),  %% query CMUX options
+    io:format("CmuxOpts = ~p\n", [CMuxOpts]),
+
+    %% FIXME: use Manuf/Model and match with priv/mux.cfg to find
+    %% the command(s) to use to enable multiplexing
+
     case gsms_uart:at(Pid,"#SELINT=2") of
 	ok ->
 	    io:format("#SELINT=2 result =~p\n", [ok]),
@@ -264,9 +256,14 @@ handle_info({gsms_uart,Pid,up}, State) ->
 	    ok
     end,
     ok = gsms_uart:at(Pid,"+CMUX=0"),  %% enable CMUX basic mode
-    ok = gsms_uart:setopts(Pid, [{packet,basic_0710},{mode,binary},
+    ok = gsms_uart:setopts(Pid, [{packet,basic_0710},
+				 {mode,binary},
 				 {active,true}]),
-    {noreply, State};
+
+    {noreply, State#state { manuf = Manuf,
+			    model = Model,
+			    cmux_opts = CMuxOpts }};
+
 handle_info({'DOWN',Ref,process,_Pid,Reason}, State) ->
     case lists:keytake(Ref, #subscriber.mon, State#state.sub) of
 	false ->

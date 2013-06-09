@@ -54,9 +54,9 @@
 %% @end
 %%--------------------------------------------------------------------
 start(_StartType, _StartArgs) ->
-    Args = case application:get_env(gsmux, arguments) of
+    Args = case application:get_all_env(gsmux) of
 	       undefined -> [];
-	       {ok,As} -> As
+	       As -> As
 	   end,
     gsmux_sup:start_link(Args).
 

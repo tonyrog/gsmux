@@ -67,7 +67,7 @@
 %%
 %% 5.4.6.3.5 Flow Control On Command (FCon)
 %%
--define(TYPE_FCON,  2#00100001).
+-define(TYPE_FCON,  2#10100001).
 
 %%
 %% 5.4.6.3.6 Flow Control Off Command (FCoff)

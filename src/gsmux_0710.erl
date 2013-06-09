@@ -97,13 +97,10 @@ start(Opts) ->
 %% @end
 %%--------------------------------------------------------------------
 init([Opts]) ->
-    Device = proplists:get_value(device, Opts),
-    Baud   = proplists:get_value(baud, Opts, 115200),
+    Uart   = proplists:get_value(uart, Opts),
     Reopen = proplists:get_value(reopen_timeout,Opts,5000),
     {Manuf,Model} = proplists:get_value(modem, Opts, {undefined,undefined}),
-    {ok,Pid} = gsms_uart:start_link([{device,Device},
-				     {baud, Baud},
-				     {reopen_timeout,Reopen}]),
+    {ok,Pid} = gsms_uart:start_link(Uart ++ [{reopen_timeout,Reopen}]),
     {ok,Ref} = gsms_uart:subscribe(Pid),  %% subscribe to all events
     {ok, #state{ drv = Pid, ref = Ref,
 		 manuf = Manuf, model = Model }}.
@@ -221,9 +218,18 @@ handle_info(_I={gsms_event,_Ref,
     end;
 handle_info({gsms_uart,Pid,up}, State) ->
     io:format("gms_uart : up\n", []),
-    timer:sleep(100),                  %% help?
-    ok = gsms_uart:at(Pid,"E0"),       %% disable echo (again)
-    timer:sleep(100),                  %% help?
+    %% timer:sleep(100),   %% help?
+    %% pull modem out of old CMUX mode
+    %% send_release(1, State) ?
+    %% send_release(2, State) ?
+    %% send_release(3, State) ?
+    send_close_cmux(State),
+    flush(State#state.ref, 100),
+    %% gsms_uart:send(Pid, "ATZ\r\n"),   %% reset ?
+    flush(State#state.ref, 1000),
+    gsms_uart:send(Pid, "ATE0\r\n"), %% disable echo (again)
+    flush(State#state.ref, 100),
+
     Manuf = case gsms_uart:at(Pid,"+CGMI") of
 		{ok,Manuf0} -> Manuf0;
 		_ -> ""
@@ -256,10 +262,10 @@ handle_info({gsms_uart,Pid,up}, State) ->
 	    ok
     end,
     ok = gsms_uart:at(Pid,"+CMUX=0"),  %% enable CMUX basic mode
+    send_establish(0, State),
     ok = gsms_uart:setopts(Pid, [{packet,basic_0710},
 				 {mode,binary},
 				 {active,true}]),
-
     {noreply, State#state { manuf = Manuf,
 			    model = Model,
 			    cmux_opts = CMuxOpts }};
@@ -308,6 +314,20 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+flush(Ref,WaitTmo) ->
+    receive
+	{gsms_event, Ref, Data} ->
+	    io:format("Flush: ~p\n", [Data]),
+	    flush(Ref,0)
+    after WaitTmo ->
+	      ok
+    end.
+
+
+send_close_cmux(State) ->
+    L = make_length(0),
+    send_packet(0, <<(?TYPE_CLD + ?COMMAND), L/binary>>, State).
+
 send_packet(Chan, Data, State) when is_integer(Chan) ->
     Control = (?CONTROL_UIH),
     Address = (Chan bsl 2) + ?COMMAND + ?NEXTENDED,
@@ -315,7 +335,7 @@ send_packet(Chan, Data, State) when is_integer(Chan) ->
 	Data1 ->
 	    Len = make_length(byte_size(Data1)),
 	    Hdr = <<Address,Control,Len/binary>>,
-	    FCS   = gsms_fcs:crc(Hdr),
+	    FCS   = gsmux_fcs:crc(Hdr),
 	    gsms_uart:send(State#state.drv, <<?BASIC,Hdr/binary,
 					      Data1/binary,
 					      FCS,
@@ -358,16 +378,98 @@ handle_packet(Address,Control,Len,Data,_FCS,Valid,State) ->
 	      [Valid,Chan,Ctrl,P,Len,Data]),
     if Ctrl =:= uih, P =:= false;
        Ctrl =:= ui,  P =:= false ->
-	    case lists:keyfind(Chan, #subscriber.channel, State#state.sub) of
-		false ->
-		    State;
-		#subscriber { pid=Pid } ->
-		    Pid ! {gsm_0710,Chan,Data},
-		    State
+	    if Chan =:= 0 ->
+		    handle_control(Data,State);
+	       true ->
+		    case lists:keyfind(Chan,#subscriber.channel,
+				       State#state.sub) of
+			false ->
+			    State;
+			#subscriber { pid=Pid } ->
+			    Pid ! {gsm_0710,Chan,Data},
+			    State
+		    end
 	    end;
        true ->
 	    State
     end.
+
+handle_control(<<Type,Len:7,1:1,Values:Len/binary>>, State) ->
+    handle_control(Type, Values, State);
+handle_control(<<Type,L0:7,0:1,L1:8,Data/binary>>, State) ->
+    Len = (L1 bsl 7) + L0,
+    case Data of
+	<<Values:Len/binary>> ->
+	    handle_control(Type,Values,State);
+	_ ->
+	    io:format("Len does not match data: len=~w, data=~w\n", [Len,Data]),
+	    State
+    end;
+handle_control(Data, State) ->
+    io:format("Bad control data: data=~w\n", [Data]),
+    State.
+
+handle_control(Type,Values,State) ->
+    T = decode_type(Type),
+    if Type band 2#10 =:= 2#00 ->
+	    io:format("handle response: ~w ~p\n", [T,Values]),
+	    handle_response(T,Values,State);
+       true ->
+	    io:format("handle command: ~w ~p\n", [T,Values]),
+	    handle_command(T,Values,State)
+    end.
+
+%% PN:
+%%   <<0:2,D:6,CL:4,I:4,0:2,P:6,T:8,N:16/little,NA:8,0:5,3:K>>
+
+handle_response(pn, <<0:2,D:6,CL:4,I:4,0:2,P:6,T:8,N:16/little,NA:8,0:5,K:3>>,
+		State) ->
+    io:format("PN; d=~w,cl=~w,I=~w,P=~w,T=~w,N=~w,NA=~w,K=~w\n",
+	      [D,CL,I,P,T,N,NA,K]),
+    State;
+handle_response(psc, _Values, State) ->
+    io:format("Power saving contro\n", []),
+    State;
+handle_response(cld, _Values, State) ->
+    io:format("Multiplexor close down\n", []),
+    State;
+handle_response(test,Values,State) ->
+    io:format("Test: ~p\n", [Values]),
+    State;
+handle_response(fcon,_Value,State) ->
+    io:format("Flow control ON\n",[]),
+    State;
+handle_response(fcoff,_Value,State) ->
+    io:format("Flow control OFF\n",[]),
+    State;
+handle_response(msc, <<DLCI:6, 1:1, 1:1,
+		       DV:1,IC:1,_:1,_:1,RTR:1,RTC:1,FC:1,0:1>>,State) ->
+    io:format("DLCI=~w,  DV=~w,IC=~w,RTR=~w,RTC=~w,FC=~w\n",
+	      [DLCI,DV,IC,RTR,RTC,FC]),
+    State;
+handle_response(_Type, _Values, State) ->
+    State.
+
+handle_command(_Type, _Values, State) ->
+    State.
+
+
+decode_type(Type) ->
+    case Type band 2#11111101 of
+	?TYPE_PN ->  pn;
+	?TYPE_PSC -> psc;
+	?TYPE_CLD -> cld;
+	?TYPE_TEST -> test;
+	?TYPE_FCON -> fcon;
+	?TYPE_FCOFF -> fcoff;
+	?TYPE_MSC -> msc;
+	?TYPE_NSC -> nsc;
+	?TYPE_RPN -> rpn;
+	?TYPE_RLS -> rls;
+	?TYPE_SNC -> snc; 
+	T -> T
+    end.
+
 
 make_length(N) when N =< 16#7f ->
     <<((N bsl 1) + 1)>>;

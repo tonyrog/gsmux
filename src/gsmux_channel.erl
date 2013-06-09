@@ -129,13 +129,10 @@ handle_info({gsm_0710,Chan,Data}, State) when Chan =:= State#state.chan ->
     uart:send(State#state.pty,Data),
     {noreply, State};
 handle_info({uart_closed,Pty}, State) when Pty =:= State#state.pty ->
+    io:format("uart_closed: re-create and link\n", []),
     %% slave disconnected / recreate the connection
     State1 = do_close(State),
     State2 = do_open(State1),
-    %% re-establish multiplexer channel?
-    R = gsmux_0710:establish(State2#state.mux,
-			     State2#state.chan),
-    io:format("establish = ~p\n", [R]),
     {noreply, State2};
 
 handle_info(_Info, State) ->
@@ -177,7 +174,8 @@ do_open(State) ->
     {ok,Pty} = uart:open("pty", [{baud,115200}]),
     {ok,Ptyname} = uart:getopt(Pty, device),
     Status = make_symlink(Ptyname, State1#state.symlink),
-    io:format("symlink status = ~p\n", [Status]),
+    io:format("~s -> ~s status = ~p\n", 
+	      [Ptyname, State1#state.symlink,Status]),
     uart:setopts(Pty, [{active,once}]),
     State1#state { pty = Pty, ptyname = Ptyname }.
 

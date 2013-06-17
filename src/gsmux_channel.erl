@@ -171,7 +171,7 @@ code_change(_OldVsn, State, _Extra) ->
 
 do_open(State) ->
     State1 = do_close(State),  %% close the old master
-    {ok,Pty} = uart:open("pty", [{baud,115200}]),
+    {ok,Pty} = uart:open("//pty", [{baud,115200}]),
     {ok,Ptyname} = uart:getopt(Pty, device),
     Status = make_symlink(Ptyname, State1#state.symlink),
     io:format("~s -> ~s status = ~p\n", 

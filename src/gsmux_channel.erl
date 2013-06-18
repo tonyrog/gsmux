@@ -21,13 +21,22 @@
 
 -record(state, 
 	{
-	  mux,       %% multiplexor (parent)
-	  chan,      %% channel number
-	  pty,       %% master side of pty
-	  symlink,   %% symlink name
-	  ptyname   %% the (pty slave) device used
+	  mux,           %% multiplexor (parent)
+	  chan,          %% channel number
+	  pty,           %% master side of pty
+	  ptypkt=false,  %% pty packet mode enabled ?
+	  symlink,       %% symlink name
+	  ptyname        %% the (pty slave) device used
 	 }).
 
+-define(TIOCPKT_DATA,		16#00).	%% data packet
+-define(TIOCPKT_FLUSHREAD,	16#01).	%% flush packet
+-define(TIOCPKT_FLUSHWRITE,	16#02).	%% flush packet
+-define(TIOCPKT_STOP,		16#04).	%% stop output
+-define(TIOCPKT_START,		16#08).	%% start output
+-define(TIOCPKT_NOSTOP,		16#10).	%% no more ^S, ^Q
+-define(TIOCPKT_DOSTOP,		16#20).	%% now do ^S ^Q
+-define(TIOCPKT_IOCTL,		16#40).	%% state change of pty driver
 %%%===================================================================
 %%% API
 %%%===================================================================
@@ -62,8 +71,11 @@ start_link(Mux, SymLink, Chan) ->
 %%--------------------------------------------------------------------
 init([Mux,SymLink,Chan]) ->
     link(Mux),
-    R = gsmux_0710:establish(Mux, Chan),  %% establish multiplexer channel
-    io:format("Establish: ~w = ~p\n", [Chan, R]),
+    R1 = gsmux_0710:establish(Mux, Chan),  %% establish multiplexer channel
+    io:format("Establish: ~w = ~p\n", [Chan, R1]),
+    %% enable the channel set FC=0!!!
+    R2 = gsmux_0710:send_line_status(Mux,Chan,1,1,0),
+    io:format("Line status: ~w = ~p\n", [Chan, R2]),
     State0 = #state{ mux = Mux, 
 		     chan = Chan,
 		     pty = undefined,
@@ -118,9 +130,10 @@ handle_cast(_Msg, State) ->
 %%--------------------------------------------------------------------
 
 handle_info({uart,Pty,Data}, State) when Pty =:= State#state.pty ->
+    {Cmd,Data1} = decode_pty_data(Data, State),
     uart:setopts(Pty, [{active,once}]),
-    io:format("~w:~s: uart data: ~p\n", 
-	      [State#state.chan,State#state.ptyname,Data]),
+    io:format("~w:~s: uart data: ~p ~p\n", 
+	      [State#state.chan,State#state.ptyname,Cmd,Data1]),
     gsmux_0710:send(State#state.mux, Data),
     {noreply, State};
 handle_info({gsm_0710,Chan,Data}, State) when Chan =:= State#state.chan ->
@@ -169,15 +182,33 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
+-define(PKTSTAT(M,F,A),
+	if (F) band (M) =/= 0 -> [F]; true -> [] end).
+
+decode_pty_data(<<Mode,Data/binary>>, State) when State#state.ptypkt ->
+    M = ?PKTSTAT(Mode,?TIOCPKT_FLUSHREAD,flushread) ++
+	?PKTSTAT(Mode,?TIOCPKT_FLUSHWRITE,flushwrite) ++
+	?PKTSTAT(Mode,?TIOCPKT_STOP,stop) ++
+	?PKTSTAT(Mode,?TIOCPKT_START,start) ++
+	?PKTSTAT(Mode,?TIOCPKT_NOSTOP,nostop) ++
+	?PKTSTAT(Mode,?TIOCPKT_DOSTOP,dostop) ++
+	?PKTSTAT(Mode,?TIOCPKT_IOCTL,ioctl),
+    {M, Data};
+decode_pty_data(Data, _State) ->
+    {[], Data}.
+
 do_open(State) ->
     State1 = do_close(State),  %% close the old master
-    {ok,Pty} = uart:open("//pty", [{baud,115200}]),
+    {ok,Pty} = uart:open("//pty", [{baud,115200},
+				   {ptypkt,true}
+				   %% {debug,debug}]),
+				   ]),
     {ok,Ptyname} = uart:getopt(Pty, device),
     Status = make_symlink(Ptyname, State1#state.symlink),
     io:format("~s -> ~s status = ~p\n", 
 	      [Ptyname, State1#state.symlink,Status]),
     uart:setopts(Pty, [{active,once}]),
-    State1#state { pty = Pty, ptyname = Ptyname }.
+    State1#state { pty = Pty, ptyname = Ptyname, ptypkt = true }.
 
 do_close(State) when State#state.ptyname =/= undefined ->
     uart:close(State#state.pty),
@@ -223,6 +254,3 @@ set_perm(Ptyname, SymLink) ->
 	    Error
     end.
 
-
-	    
-    

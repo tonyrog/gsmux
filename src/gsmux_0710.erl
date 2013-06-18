@@ -18,6 +18,7 @@
 	 terminate/2, code_change/3]).
 -export([establish/2, release/2, send/2]).
 -export([closedown/1, send_test/2]).
+-export([send_line_status/5, send_line_status/6]).
 
 -define(SERVER, ?MODULE). 
 
@@ -35,7 +36,8 @@
 	  sub = [] :: [#subscriber{}],
 	  manuf,
 	  model,
-	  cmux_opts
+	  cmux_opts,
+	  flowon = true        %% controlled by fcon/fcoff
 	 }).
 
 -include("gsmux_0710.hrl").
@@ -55,6 +57,19 @@ release(Pid, I) ->
 closedown(Pid) ->
     L = make_length(0),
     send_chan(Pid, 0, <<(?TYPE_CLD + ?COMMAND), L/binary>>).
+
+%% send msc
+send_line_status(Pid,I,RTS,DTR,FC) ->
+    L = make_length(2),
+    send_chan(Pid, 0, << (?TYPE_MSC + ?COMMAND), L/binary,
+			 I:6, 1:1, 1:1, 
+			 ?MSC_V24_COMMAND(RTS,DTR,FC) >>).
+
+send_line_status(Pid,I,RTS,DTR,FC,Break) ->
+    L = make_length(3),
+    send_chan(Pid, 0, << (?TYPE_MSC + ?COMMAND), L/binary,
+			 I:6, 1:1, 1:1, 
+			 ?MSC_V24_COMMAND(RTS,DTR,FC), Break >>).
 
 send_test(Pid, Data) ->
     Data1 = iolist_to_binary(Data),
@@ -97,6 +112,7 @@ start(Opts) ->
 %% @end
 %%--------------------------------------------------------------------
 init([Opts]) ->
+    io:format("gsm_0710: init ~p\n", [Opts]),
     Uart   = proplists:get_value(uart, Opts),
     Reopen = proplists:get_value(reopen_timeout,Opts,5000),
     {Manuf,Model} = proplists:get_value(modem, Opts, {undefined,undefined}),
@@ -366,11 +382,11 @@ handle_packet(Address,Control,Len,Data,_FCS,Valid,State) ->
     P = (Control band ?CONTROL_P) =/= 0,
     Ctrl = case Control band (bnot ?CONTROL_P) of
 	       ?CONTROL_SABM -> sabm;
-	       ?CONTROL_UA -> ua;
-	       ?CONTROL_DM -> dm;
-	       ?CONTROL_DISC-> disc;
-	       ?CONTROL_UIH -> uih;
-	       ?CONTROL_UI -> ui;
+	       ?CONTROL_UA   -> ua;
+	       ?CONTROL_DM   -> dm;
+	       ?CONTROL_DISC -> disc;
+	       ?CONTROL_UIH  -> uih;
+	       ?CONTROL_UI   -> ui;
 	       C -> C
 	   end,
     Chan = (Address bsr 2),
@@ -424,28 +440,29 @@ handle_control(Type,Values,State) ->
 
 handle_response(pn, <<0:2,D:6,CL:4,I:4,0:2,P:6,T:8,N:16/little,NA:8,0:5,K:3>>,
 		State) ->
-    io:format("PN; d=~w,cl=~w,I=~w,P=~w,T=~w,N=~w,NA=~w,K=~w\n",
+    io:format("pn: d=~w,cl=~w,I=~w,P=~w,T=~w,N=~w,NA=~w,K=~w\n",
 	      [D,CL,I,P,T,N,NA,K]),
     State;
 handle_response(psc, _Values, State) ->
-    io:format("Power saving contro\n", []),
+    io:format("psc: Power saving contro\n", []),
     State;
 handle_response(cld, _Values, State) ->
-    io:format("Multiplexor close down\n", []),
+    io:format("cld: Multiplexor close down\n", []),
     State;
 handle_response(test,Values,State) ->
-    io:format("Test: ~p\n", [Values]),
+    io:format("test: ~p\n", [Values]),
     State;
 handle_response(fcon,_Value,State) ->
-    io:format("Flow control ON\n",[]),
+    io:format("fcon: Flow control ON\n",[]),
     State;
 handle_response(fcoff,_Value,State) ->
-    io:format("Flow control OFF\n",[]),
+    io:format("fcoff: Flow control OFF\n",[]),
     State;
 handle_response(msc, <<DLCI:6, 1:1, 1:1,
-		       DV:1,IC:1,_:1,_:1,RTR:1,RTC:1,FC:1,0:1>>,State) ->
-    io:format("DLCI=~w,  DV=~w,IC=~w,RTR=~w,RTC=~w,FC=~w\n",
-	      [DLCI,DV,IC,RTR,RTC,FC]),
+		       ?MSC_V24_RESPONSE(DCD,RING,CTS,DSR,FC),
+		       _Break/binary>>, State) ->
+    io:format("msc: DLCI=~w,  DCD=~w,RING=~w,CTS=~w,DSR=~w,FC=~w\n",
+	      [DLCI,DCD,RING,CTS,DSR,FC]),
     State;
 handle_response(_Type, _Values, State) ->
     State.
@@ -476,4 +493,4 @@ make_length(N) when N =< 16#7f ->
 make_length(N) when N =< 16#7fff ->
     L0 = N band 16#7f,
     L1 = N bsr 7,
-    <<L0:7,1:0,L1>>.
+    <<L0:7,0:1,L1>>.

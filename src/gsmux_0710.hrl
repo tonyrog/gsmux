@@ -75,9 +75,15 @@
 -define(TYPE_FCOFF,  2#01100001).
 
 %%
-%% 5.4.6.3.7 Modem Status Command (length=2) 
-%% <<?MSC_COMMAND:8, 2:8, DLCI:8, V24:8>>
+%% 5.4.6.3.7 Modem Status Command 
+%% <<?TYPE_MSC:8, 2:8, DLCI:8, V24:8>>          (length=2) 
+%% <<?TYPE_MSC:8, 3:8, DLCI:8, V24:8,BREAK:8>>  (length=3)
 -define(TYPE_MSC,  2#11100001).
+
+-define(MSC_V24_RESPONSE(DCD,RING,CTS,DSR,FC),
+	DCD:1,RING:1,_:1,_:1,CTS:1,DSR:1,FC:1,_:1).
+-define(MSC_V24_COMMAND(RTS,DTR,FC),
+	0:1,0:1,0:1,0:1,RTS:1,DTR:1,FC:1,1:1).
 
 %%
 %% 5.4.6.3.8  Non Supported Command Response (NSC)

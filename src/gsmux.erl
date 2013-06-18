@@ -15,6 +15,7 @@ start() ->
     application:start(gsmux).
 
 start_link(Opts) ->
+    io:format("gsm_mux: start_link ~p\n", [Opts]),
     case gsmux_0710:start_link(Opts) of
 	{ok,Pid} ->
 	    timer:sleep(3000),   %% up ? mux? fixme

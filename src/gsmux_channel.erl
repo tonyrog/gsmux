@@ -134,7 +134,7 @@ handle_info({uart,Pty,Data}, State) when Pty =:= State#state.pty ->
     uart:setopts(Pty, [{active,once}]),
     io:format("~w:~s: uart data: ~p ~p\n", 
 	      [State#state.chan,State#state.ptyname,Cmd,Data1]),
-    gsmux_0710:send(State#state.mux, Data),
+    gsmux_0710:send(State#state.mux, Data1),
     {noreply, State};
 handle_info({gsm_0710,Chan,Data}, State) when Chan =:= State#state.chan ->
     io:format("~w:~s: mux data: ~p\n", 
@@ -183,7 +183,7 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 
 -define(PKTSTAT(M,F,A),
-	if (F) band (M) =/= 0 -> [F]; true -> [] end).
+	if (F) band (M) =/= 0 -> [A]; true -> [] end).
 
 decode_pty_data(<<Mode,Data/binary>>, State) when State#state.ptypkt ->
     M = ?PKTSTAT(Mode,?TIOCPKT_FLUSHREAD,flushread) ++
@@ -199,8 +199,10 @@ decode_pty_data(Data, _State) ->
 
 do_open(State) ->
     State1 = do_close(State),  %% close the old master
+    PtyPkt = true,
     {ok,Pty} = uart:open("//pty", [{baud,115200},
-				   {ptypkt,true}
+				   {mode,binary},
+				   {ptypkt,PtyPkt}
 				   %% {debug,debug}]),
 				   ]),
     {ok,Ptyname} = uart:getopt(Pty, device),
@@ -208,7 +210,7 @@ do_open(State) ->
     io:format("~s -> ~s status = ~p\n", 
 	      [Ptyname, State1#state.symlink,Status]),
     uart:setopts(Pty, [{active,once}]),
-    State1#state { pty = Pty, ptyname = Ptyname, ptypkt = true }.
+    State1#state { pty = Pty, ptyname = Ptyname, ptypkt = PtyPkt }.
 
 do_close(State) when State#state.ptyname =/= undefined ->
     uart:close(State#state.pty),

@@ -10,16 +10,6 @@
 -export([table/0, init/1, final/2, update/3, update_byte/3]).
 -export([crc/1, is_valid/2]).
 
-%%
-%% Use gsms_uart to enter AT+CMUX=0, then what?
-%% I guess we should implment the above packet type in gsms_uart
-%% and allow receiving and sending such frames through gsms_uart
-%%
-%% Then allocate [1-3] gsms_0710_channel processes, the processes will 
-%% behave like a gsms_uart process but use a real gsms_uart 
-%% process in MUX mode.
-%%
-
 -record(crc_table,
 	{
 	  poly,    %% list of power polynomial exponents X^5 + X^3 + 1 = [5,3,0]

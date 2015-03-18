@@ -19,8 +19,13 @@
 -export([establish/2, release/2, send/2]).
 -export([closedown/1, send_test/2]).
 -export([send_line_status/5, send_line_status/6]).
+-export([stuff/1, unstuff/1, make_length/1]).
 
 -define(SERVER, ?MODULE). 
+
+-include("gsmux_0710.hrl").
+
+-define(is_chan(X), (X band (bnot 16#3f)) =:= 0).
 
 -record(subscriber,
 	{
@@ -29,7 +34,6 @@
 	  mon          :: reference()
 	}).
 
-
 -record(state, {
 	  drv :: pid(),        %% uart driver pid
 	  ref :: reference(),  %% uart subscription ref
@@ -37,12 +41,11 @@
 	  manuf,
 	  model,
 	  cmux_opts,
+	  encoding = ?BASIC,
+	  mtu = 64,
+	  mru = 64,
 	  flowon = true        %% controlled by fcon/fcoff
 	 }).
-
--include("gsmux_0710.hrl").
-
--define(is_chan(X), (X band (bnot 16#3f)) =:= 0).
 
 %%%===================================================================
 %%% API
@@ -115,11 +118,19 @@ init([Opts]) ->
     io:format("gsm_0710: init ~p\n", [Opts]),
     Uart   = proplists:get_value(uart, Opts),
     Reopen = proplists:get_value(reopen_timeout,Opts,5000),
+    MRU    = proplists:get_value(mru,Opts,64),
+    MTU    = proplists:get_value(mtu,Opts,64),
+    Encoding = proplists:get_value(encoding,Opts,?BASIC),
     {Manuf,Model} = proplists:get_value(modem, Opts, {undefined,undefined}),
     {ok,Pid} = gsms_uart:start_link(Uart ++ [{reopen_timeout,Reopen}]),
     {ok,Ref} = gsms_uart:subscribe(Pid),  %% subscribe to all events
-    {ok, #state{ drv = Pid, ref = Ref,
-		 manuf = Manuf, model = Model }}.
+    {ok, #state{ drv = Pid, 
+		 ref = Ref,
+		 mru = MRU,
+		 mtu = MTU,
+		 encoding = Encoding,
+		 manuf = Manuf, 
+		 model = Model }}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -232,6 +243,19 @@ handle_info(_I={gsms_event,_Ref,
 	    io:format("Got info: ~p\n", [_I]),
 	    {noreply, State}
     end;
+handle_info({gsms_event,_Ref,{data,<<?ADVANCED,Data0/binary>>}}, State) ->
+    Data1 = unstuff(Data0),
+    Len = byte_size(Data1)-4,
+    <<Address:8,Control:8,Data:Len/binary,FCS,?ADVANCED>> = Data1,
+    Valid = if Control =:= ?CONTROL_UIH ->
+		    gsmux_fcs:is_valid(<<Address,Control>>,FCS);
+	       Control =:= ?CONTROL_UI ->
+		    gsmux_fcs:is_valid([<<Address,Control>>,Data],FCS);
+	       true ->
+		    unchecked
+	    end,
+    State1 = handle_packet(Address,Control,Len,Data,FCS,Valid,State),
+    {noreply, State1};
 handle_info({gsms_uart,Pid,up}, State) ->
     io:format("gms_uart : up\n", []),
     %% timer:sleep(100),   %% help?
@@ -349,13 +373,8 @@ send_packet(Chan, Data, State) when is_integer(Chan) ->
     Address = (Chan bsl 2) + ?COMMAND + ?NEXTENDED,
     try iolist_to_binary(Data) of
 	Data1 ->
-	    Len = make_length(byte_size(Data1)),
-	    Hdr = <<Address,Control,Len/binary>>,
-	    FCS   = gsmux_fcs:crc(Hdr),
-	    gsms_uart:send(State#state.drv, <<?BASIC,Hdr/binary,
-					      Data1/binary,
-					      FCS,
-					      ?BASIC>>)
+	    send_frame(State#state.drv,State#state.encoding,
+		       Address,Control,Data1)
     catch
 	error:_ -> %% crash client
 	    {error,badarg}
@@ -364,19 +383,25 @@ send_packet(Chan, Data, State) when is_integer(Chan) ->
 send_establish(Chan, State) when ?is_chan(Chan) ->
     Control = (?CONTROL_SABM+?CONTROL_P),
     Address = (Chan bsl 2) + ?COMMAND + ?NEXTENDED,
-    Length  = 0,
-    Hdr     = <<Address,Control,Length:7,1:1>>,
-    FCS     = gsmux_fcs:crc(Hdr),
-    gsms_uart:send(State#state.drv, <<?BASIC,Hdr/binary,FCS,?BASIC>>).
+    send_frame(State#state.drv,State#state.encoding,Address,Control,<<>>).
 
 send_release(Chan, State) when ?is_chan(Chan) ->
     Control = (?CONTROL_DISC+?CONTROL_P),
     Address = (Chan bsl 2) + ?COMMAND + ?NEXTENDED,
-    Length  = 0,
-    Hdr     = <<Address,Control,Length:7,1:1>>,
-    FCS     = gsmux_fcs:crc(Hdr),
-    gsms_uart:send(State#state.drv,<<?BASIC,Hdr/binary,FCS,?BASIC>>).
+    send_frame(State#state.drv,State#state.encoding,Address,Control,<<>>).
 
+
+send_frame(U, ?BASIC, Address, Control, Data) ->
+    Len = make_length(byte_size(Data)),
+    Hdr = <<Address,Control,Len/binary>>,
+    FCS = gsmux_fcs:crc(Hdr),
+    gsms_uart:send(U, <<?BASIC,Hdr/binary,Data/binary,FCS,?BASIC>>);
+send_frame(U, ?ADVANCED, Address, Control, Data) ->
+    Hdr = <<Address,Control>>,    
+    FCS = gsmux_fcs:crc(Hdr),
+    Data1 = stuff(<<Hdr/binary,Data/binary,FCS>>),
+    gsms_uart:send(U, <<?ADVANCED,Data1/binary,?ADVANCED>>).
+    
 
 handle_packet(Address,Control,Len,Data,_FCS,Valid,State) ->
     P = (Control band ?CONTROL_P) =/= 0,
@@ -494,3 +519,34 @@ make_length(N) when N =< 16#7fff ->
     L0 = N band 16#7f,
     L1 = N bsr 7,
     <<L0:7,0:1,L1>>.
+
+-define(ESCAPE, 2#01111101). %% 0x7D
+-define(TOGGLE, 2#00100000). %% 0x20
+-define(XON,    $\^Q).  %% 0x11
+-define(XOFF,   $\^S).  %% 0x13
+
+%% bytestuff and "advanced frame"
+stuff(Binary) ->
+    stuff(Binary, <<>>).
+
+stuff(<<?ADVANCED,Tail/binary>>, Acc) -> escape(?ADVANCED, Tail, Acc);
+stuff(<<?ESCAPE,Tail/binary>>,Acc) -> escape(?ESCAPE, Tail, Acc);
+stuff(<<?XON,Tail/binary>>,Acc) -> escape(?XON, Tail, Acc);
+stuff(<<?XOFF,Tail/binary>>,Acc) -> escape(?XOFF, Tail, Acc);
+stuff(<<C,Tail/binary>>,Acc) ->  stuff(Tail, <<Acc/binary,C>>);
+stuff(<<>>,Acc) -> Acc.
+
+escape(C, Tail, Acc) ->
+    stuff(Tail, <<Acc/binary,?ESCAPE,(C bxor ?TOGGLE)>>).
+
+
+%% byteunstuff and "advanced frame"
+unstuff(Binary) ->
+    unstuff(Binary, <<>>).
+
+unstuff(<<?ESCAPE,C,Tail/binary>>, Acc) ->
+    unstuff(Tail, <<Acc/binary,(C bxor ?TOGGLE)>>);
+unstuff(<<C,Tail/binary>>, Acc) ->
+    unstuff(Tail, <<Acc/binary,C>>);
+unstuff(<<>>, Acc) ->
+    Acc.
